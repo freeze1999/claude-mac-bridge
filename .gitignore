@@ -1,0 +1,7 @@
+.env
+bridge.log
+*.log
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
