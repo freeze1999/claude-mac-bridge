@@ -68,6 +68,8 @@ ssh -i ~/.ssh/mac_bridge user@<mac-tailscale-ip> "echo ok"
 | `CLAUDE_BRIDGE_CLAUDE_BIN` | ❌ | `claude` | Path to Claude binary on the Mac |
 | `CLAUDE_BRIDGE_TIMEOUT` | ❌ | `600` | Max seconds per delegation (wall-clock, never pauses) |
 | `CLAUDE_BRIDGE_LOG_PATH` | ❌ | `./bridge.log` | Path for the delegation audit log |
+| `CLAUDE_BRIDGE_LOG_MAX_BYTES` | ❌ | `10000000` | Size-rotate the log (one `.1` generation kept) |
+| `CLAUDE_BRIDGE_SKIP_PERMISSIONS` | ❌ | `false` | Run Claude with `--dangerously-skip-permissions` (read the trust boundary below first) |
 
 ### 3. Wire into MCP config
 
@@ -230,3 +232,25 @@ Color-coded live TUI showing start/done/error/timeout events with task previews,
 ## License
 
 MIT.
+
+## Trust boundary
+
+By default the bridge runs Claude Code under the Mac's own permission
+configuration. Setting `CLAUDE_BRIDGE_SKIP_PERMISSIONS=true` removes that
+layer: any agent that can call this MCP tool then has arbitrary code
+execution on the Mac. Only enable it if the MCP server is reachable
+exclusively by agents you would hand a shell to.
+
+The audit log (`bridge.log`) records the full task, context, and response
+text of every delegation. Treat it as sensitive and leave it out of any
+repo (it is gitignored here).
+
+## Status
+
+What this is: a single-tool MCP server that delegates tasks to Claude Code
+on one Mac over SSH, with session continuity and an audit log.
+
+What this is NOT: an authentication layer, a sandbox, or a multi-host
+router. The argument building, output parsing, and log rotation are
+unit-tested; the SSH path is exercised by supervised live delegations, not
+CI. This file has a sibling repo, see PORTING.md.
