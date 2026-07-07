@@ -9,6 +9,11 @@ Configuration (env vars):
   CLAUDE_BRIDGE_CLAUDE_BIN Path to claude binary on the Mac  (default: claude)
   CLAUDE_BRIDGE_TIMEOUT    Seconds before timeout            (default: 600)
   CLAUDE_BRIDGE_LOG_PATH   Path to delegation audit log      (default: ./bridge.log)
+  CLAUDE_BRIDGE_LOG_MAX_BYTES  Rotate the log past this size (default: 10000000)
+  CLAUDE_BRIDGE_SKIP_PERMISSIONS  "true" to run Claude with
+    --dangerously-skip-permissions. Default false: Claude Code's own
+    permission config on the Mac applies. Setting this true means any agent
+    that can call this MCP tool has arbitrary code execution on the Mac.
 """
 
 import asyncio
@@ -30,6 +35,9 @@ SSH_OPTS       = ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
                   "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3"]
 LOG_FILE       = os.environ.get("CLAUDE_BRIDGE_LOG_PATH",
                    os.path.join(os.path.dirname(__file__), "bridge.log"))
+LOG_MAX_BYTES  = int(os.environ.get("CLAUDE_BRIDGE_LOG_MAX_BYTES", "10000000"))
+SKIP_PERMISSIONS = os.environ.get(
+    "CLAUDE_BRIDGE_SKIP_PERMISSIONS", "false").strip().lower() in ("1", "true", "yes")
 
 app = Server("claude-bridge")
 
@@ -50,13 +58,67 @@ async def _log_claude_version():
                    "ts": datetime.now(timezone.utc).isoformat()})
 
 
-def log_event(event: dict):
+def should_rotate(path: str, max_bytes: int) -> bool:
     try:
+        return max_bytes > 0 and os.path.getsize(path) >= max_bytes
+    except OSError:
+        return False
+
+
+def log_event(event: dict):
+    """Append one JSON line; size-rotate to a single .1 generation first.
+    The log holds full task/response text, rotation keeps it from growing
+    without bound."""
+    try:
+        if should_rotate(LOG_FILE, LOG_MAX_BYTES):
+            os.replace(LOG_FILE, LOG_FILE + ".1")
         with open(LOG_FILE, "a") as f:
             f.write(json.dumps(event) + "\n")
             f.flush()
     except Exception:
         pass
+
+
+def build_claude_args(claude_bin: str, resume_session: str,
+                      skip_permissions: bool) -> list[str]:
+    """The literal '"$TASK"' is load-bearing: the task text is piped in over
+    stdin (remote command starts with TASK=$(cat)) so it never touches the
+    command line and cannot inject into the shell. Do not "fix" it into an
+    f-string or shlex.quote of the prompt."""
+    args = [claude_bin, "-p", '"$TASK"', "--output-format", "json"]
+    if skip_permissions:
+        args.append("--dangerously-skip-permissions")
+    if resume_session:
+        args += ["--resume", shlex.quote(resume_session)]
+    return args
+
+
+def build_remote_command(args: list[str], timeout_s: int) -> str:
+    """Wrap with a remote timeout so Claude is killed on the Mac if SSH drops.
+    Portable: 'timeout' (GNU) or 'gtimeout' (macOS + coreutils), or no
+    timeout if neither exists. Remote budget is 10s under the local one so
+    the remote side dies first."""
+    remote_timeout = max(timeout_s - 10, 30)
+    prefix = (
+        '_T=$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true); '
+        f'${{_T:+$_T {remote_timeout}}}'
+    )
+    return f'TASK=$(cat); {prefix} {" ".join(args)}'
+
+
+def parse_result(raw: str) -> dict:
+    """Parse `claude --output-format json` stdout. Falls back to the raw text
+    when it is not JSON (older CLIs, crash output)."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"result": raw, "session_id": "", "cost": 0.0,
+                "is_error": False, "structured": False}
+    return {"result": data.get("result", "(no result)"),
+            "session_id": data.get("session_id", ""),
+            "cost": data.get("total_cost_usd", 0),
+            "is_error": data.get("is_error", False),
+            "structured": True}
 
 
 @app.list_tools()
@@ -128,21 +190,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
     prompt = f"Context:\n{context}\n\n---\n\nTask:\n{task}" if context else task
 
-    claude_args = [MAC_CLAUDE, "-p", '"$TASK"',
-                   "--output-format", "json",
-                   "--dangerously-skip-permissions"]
-    if resume_session:
-        claude_args += ["--resume", shlex.quote(resume_session)]
-
-    # Wrap with remote timeout so Claude is killed on the Mac if SSH drops.
-    # Uses portable shell: 'timeout' (Linux/GNU) or 'gtimeout' (macOS + coreutils).
-    # Falls back to no timeout if neither is available.
-    _remote_timeout = max(CLAUDE_TIMEOUT - 10, 30)
-    _timeout_prefix = (
-        f'_T=$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true); '
-        f'${{_T:+$_T {_remote_timeout}}}'
-    )
-    remote_cmd = f'TASK=$(cat); {_timeout_prefix} {" ".join(claude_args)}'
+    claude_args = build_claude_args(MAC_CLAUDE, resume_session, SKIP_PERMISSIONS)
+    remote_cmd  = build_remote_command(claude_args, CLAUDE_TIMEOUT)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -178,19 +227,18 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                         "duration": duration, "error": err})
             return [types.TextContent(type="text", text=f"Claude error: {err}")]
 
-        raw = stdout.decode().strip()
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
+        raw    = stdout.decode().strip()
+        parsed = parse_result(raw)
+        if not parsed["structured"]:
             log_event({"event": "done", "id": call_id,
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "duration": duration, "response": raw})
             return [types.TextContent(type="text", text=raw)]
 
-        result     = data.get("result", "(no result)")
-        session_id = data.get("session_id", "")
-        cost       = data.get("total_cost_usd", 0)
-        is_error   = data.get("is_error", False)
+        result     = parsed["result"]
+        session_id = parsed["session_id"]
+        cost       = parsed["cost"]
+        is_error   = parsed["is_error"]
 
         log_event({
             "event":      "done",
