@@ -16,7 +16,7 @@ This bridge:
 - **Zero config on the Mac**: Claude Code runs headless via `-p`, no GUI needed
 - **Full audit trail**: every delegation logged to `bridge.log` with cost + duration
 
-## Quick Start
+## Quick start
 
 ```bash
 # 1. Install
@@ -114,7 +114,7 @@ r2 = ask_claude(
 )
 ```
 
-## Session Chaining
+## Session chaining
 
 Every response includes a `session_id`. Pass it back as `resume_session_id` to continue the same conversation, Claude remembers all prior context, files read, and decisions made.
 
@@ -128,7 +128,7 @@ r2 = ask_claude(task="Add rate limiting to the auth module", resume_session_id="
 r3 = ask_claude(task="Write tests for all of it", resume_session_id="abc123")
 ```
 
-## Long Tasks: tmux Blocking Loop
+## Long tasks: the tmux blocking loop
 
 The MCP tool has a hard wall-clock timeout (default 600s). For tasks that may run longer, project scaffolding, npm installs, multi-file builds, use this tmux pattern instead. It blocks until Claude finishes, auto-handles confirmation prompts, and returns the full result + `session_id`.
 
@@ -209,7 +209,7 @@ Color-coded live TUI showing start/done/error/timeout events with task previews,
 | `Host key verification failed` | Mac host key unknown | `ssh -o StrictHostKeyChecking=accept-new user@<ip>` once |
 | `Permission denied (publickey)` | SSH key not deployed | Run `ssh-copy-id`, verify with `ssh -i ~/.ssh/mac_bridge user@<ip>` |
 | `claude: command not found` | Wrong binary path | Set `CLAUDE_BRIDGE_CLAUDE_BIN` to full path (`which claude` on Mac) |
-| Bridge times out | Task too long for `CLAUDE_BRIDGE_TIMEOUT` | Increase timeout via env var, or use the tmux pattern for tasks >10 min (see Long Tasks section) |
+| Bridge times out | Task too long for `CLAUDE_BRIDGE_TIMEOUT` | Increase timeout via env var, or use the tmux pattern for tasks >10 min (see the long tasks section) |
 | `is_error: true` with no detail | Claude returned an error | Check `bridge.log` for full response |
 | Session not continuing | Claude process ended on Mac | Sessions live as long as the daemon on Mac, restarting Mac or Claude clears them |
 | `TASK=$(cat)` errors with special chars | Prompt has unmatched quotes or shell metacharacters | The JSON output format should handle escaping, if hit, wrap task in a temp file |
@@ -218,16 +218,16 @@ Color-coded live TUI showing start/done/error/timeout events with task previews,
 
 - `bridge.log` contains full task/response history, **it is gitignored**, keep it local
 - Never commit `.env` or SSH private keys
-- `--dangerously-skip-permissions` is passed to Claude so it can use tools without interactive prompts, only use this on a trusted Mac you control
+- `--dangerously-skip-permissions` is passed only when you set `CLAUDE_BRIDGE_SKIP_PERMISSIONS=true`, which removes Claude Code's own permission layer, only do that on a trusted Mac you control
 - The SSH command runs as-is on your Mac, do not expose this bridge to untrusted clients
 
-## Known Limitations
+## Known limitations
 
 - **Mac must be awake + on Tailscale.** If the Mac sleeps or goes offline, delegations timeout.
 - **Session lifetime depends on Claude process.** If Claude restarts (Mac reboot, crash), session IDs are lost.
 - **`bridge.log` grows unbounded.** No log rotation, monitor size or add your own.
 - Async server, concurrent tool calls are supported but each delegation opens its own SSH connection to the Mac.
-- **`--dangerously-skip-permissions` is hardcoded.** If you want to review permissions per-call, fork and modify.
+- **The permission bypass is per-server, not per-call.** `CLAUDE_BRIDGE_SKIP_PERMISSIONS` is read once at startup, so every delegation shares whatever the process began with.
 
 ## License
 
