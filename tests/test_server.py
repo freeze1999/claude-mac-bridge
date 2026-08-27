@@ -6,6 +6,8 @@ import asyncio
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from server import (
@@ -15,6 +17,50 @@ from server import (
     should_rotate,
 )
 import server
+
+
+class FakeProcess:
+    def __init__(self, delay=0):
+        self.delay = delay
+        self.returncode = 0
+        self.input = None
+        self.terminated = False
+
+    async def communicate(self, input=None):
+        self.input = input
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return b"stdout", b"stderr"
+
+    def terminate(self):
+        self.terminated = True
+
+    async def wait(self):
+        return self.returncode
+
+
+def test_run_ssh_command_returns_process_output(monkeypatch):
+    proc = FakeProcess()
+
+    async def create_process(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", create_process)
+    result = asyncio.run(server._run_ssh_command("remote", "prompt", 1))
+    assert result == (0, b"stdout", b"stderr")
+    assert proc.input == b"prompt"
+
+
+def test_run_ssh_command_cleans_up_timeout(monkeypatch):
+    proc = FakeProcess(delay=1)
+
+    async def create_process(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", create_process)
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(server._run_ssh_command("remote", "prompt", 0.001))
+    assert proc.terminated
 
 
 def test_args_default_has_no_skip_permissions():
@@ -92,6 +138,33 @@ def test_parse_result_non_json_falls_back():
     p = parse_result("plain text crash output")
     assert p["structured"] is False
     assert p["result"] == "plain text crash output"
+
+
+def test_format_claude_response_structured(tmp_path):
+    original_log = server.LOG_FILE
+    server.LOG_FILE = str(tmp_path / "bridge.log")
+    try:
+        response = server._format_claude_response(
+            '{"result":"done","session_id":"s1","total_cost_usd":0.12}',
+            "call1", 1.5,
+        )
+    finally:
+        server.LOG_FILE = original_log
+    assert response[0].text.endswith("session_id: `s1`  $0.1200  1.5s")
+
+
+def test_format_claude_response_error_and_raw(tmp_path):
+    original_log = server.LOG_FILE
+    server.LOG_FILE = str(tmp_path / "bridge.log")
+    try:
+        error = server._format_claude_response(
+            '{"result":"boom","is_error":true}', "call1", 1.0
+        )
+        raw = server._format_claude_response("plain output", "call2", 2.0)
+    finally:
+        server.LOG_FILE = original_log
+    assert error[0].text == "Claude error: boom"
+    assert raw[0].text == "plain output"
 
 
 def test_should_rotate(tmp_path):

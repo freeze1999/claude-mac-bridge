@@ -167,6 +167,65 @@ async def list_tools() -> list[types.Tool]:
     ]
 
 
+async def _stop_process(proc: asyncio.subprocess.Process) -> None:
+    """Terminate a timed-out SSH process, escalating to kill if needed."""
+    proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+
+
+async def _run_ssh_command(remote_cmd: str, prompt: str,
+                           timeout_s: int) -> tuple[int, bytes, bytes]:
+    """Run one remote command and keep timeout cleanup out of tool dispatch."""
+    proc = await asyncio.create_subprocess_exec(
+        "ssh", *SSH_OPTS, MAC_HOST, remote_cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=prompt.encode()), timeout=timeout_s
+        )
+    except asyncio.TimeoutError:
+        await _stop_process(proc)
+        raise
+    return proc.returncode or 0, stdout, stderr
+
+
+def _format_claude_response(raw: str, call_id: str,
+                            duration: float) -> list[types.TextContent]:
+    """Parse, log, and format a successful Claude process response."""
+    parsed = parse_result(raw)
+    if not parsed["structured"]:
+        log_event({"event": "done", "id": call_id,
+                   "ts": datetime.now(timezone.utc).isoformat(),
+                   "duration": duration, "response": raw})
+        return [types.TextContent(type="text", text=raw)]
+
+    result = parsed["result"]
+    session_id = parsed["session_id"]
+    cost = parsed["cost"]
+    log_event({
+        "event":      "done",
+        "id":         call_id,
+        "ts":         datetime.now(timezone.utc).isoformat(),
+        "duration":   duration,
+        "session_id": session_id,
+        "cost_usd":   cost,
+        "response":   result,
+    })
+
+    if parsed["is_error"]:
+        return [types.TextContent(type="text", text=f"Claude error: {result}")]
+
+    footer = f"\n\n---\n session_id: `{session_id}`  ${cost:.4f}  {duration}s"
+    return [types.TextContent(type="text", text=result + footer)]
+
+
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     if name != "ask_claude":
@@ -207,68 +266,27 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     remote_cmd  = build_remote_command(claude_args, CLAUDE_TIMEOUT, workdir)
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "ssh", *SSH_OPTS, MAC_HOST, remote_cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        returncode, stdout, stderr = await _run_ssh_command(
+            remote_cmd, prompt, CLAUDE_TIMEOUT
         )
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode()), timeout=CLAUDE_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-            duration = round(time.monotonic() - started_at, 1)
-            log_event({"event": "timeout", "id": call_id,
-                        "ts": datetime.now(timezone.utc).isoformat(), "duration": duration})
-            return [types.TextContent(type="text",
-                text=f"Claude timed out after {CLAUDE_TIMEOUT}s.")]
-
         duration = round(time.monotonic() - started_at, 1)
 
-        if proc.returncode != 0:
-            err = stderr.decode(errors="replace").strip() or f"exit code {proc.returncode}"
+        if returncode != 0:
+            err = stderr.decode(errors="replace").strip() or f"exit code {returncode}"
             log_event({"event": "error", "id": call_id,
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "duration": duration, "error": err})
             return [types.TextContent(type="text", text=f"Claude error: {err}")]
 
-        raw    = stdout.decode(errors="replace").strip()
-        parsed = parse_result(raw)
-        if not parsed["structured"]:
-            log_event({"event": "done", "id": call_id,
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "duration": duration, "response": raw})
-            return [types.TextContent(type="text", text=raw)]
+        raw = stdout.decode(errors="replace").strip()
+        return _format_claude_response(raw, call_id, duration)
 
-        result     = parsed["result"]
-        session_id = parsed["session_id"]
-        cost       = parsed["cost"]
-        is_error   = parsed["is_error"]
-
-        log_event({
-            "event":      "done",
-            "id":         call_id,
-            "ts":         datetime.now(timezone.utc).isoformat(),
-            "duration":   duration,
-            "session_id": session_id,
-            "cost_usd":   cost,
-            "response":   result,
-        })
-
-        if is_error:
-            return [types.TextContent(type="text", text=f"Claude error: {result}")]
-
-        footer = f"\n\n---\n session_id: `{session_id}`  ${cost:.4f}  {duration}s"
-        return [types.TextContent(type="text", text=result + footer)]
-
+    except asyncio.TimeoutError:
+        duration = round(time.monotonic() - started_at, 1)
+        log_event({"event": "timeout", "id": call_id,
+                   "ts": datetime.now(timezone.utc).isoformat(), "duration": duration})
+        return [types.TextContent(type="text",
+            text=f"Claude timed out after {CLAUDE_TIMEOUT}s.")]
     except Exception as exc:
         duration = round(time.monotonic() - started_at, 1)
         err = f"Bridge error ({type(exc).__name__}): {exc}"
