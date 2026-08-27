@@ -46,7 +46,7 @@ async def _log_claude_version():
     """Log the Claude Code CLI version at startup for debugging."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ssh", *SSH_OPTS, MAC_HOST, f"{MAC_CLAUDE} --version",
+            "ssh", *SSH_OPTS, MAC_HOST, f"{shlex.quote(MAC_CLAUDE)} --version",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
@@ -85,7 +85,7 @@ def build_claude_args(claude_bin: str, resume_session: str,
     stdin (remote command starts with TASK=$(cat)) so it never touches the
     command line and cannot inject into the shell. Do not "fix" it into an
     f-string or shlex.quote of the prompt."""
-    args = [claude_bin, "-p", '"$TASK"', "--output-format", "json"]
+    args = [shlex.quote(claude_bin), "-p", '"$TASK"', "--output-format", "json"]
     if skip_permissions:
         args.append("--dangerously-skip-permissions")
     if resume_session:
@@ -93,7 +93,8 @@ def build_claude_args(claude_bin: str, resume_session: str,
     return args
 
 
-def build_remote_command(args: list[str], timeout_s: int) -> str:
+def build_remote_command(args: list[str], timeout_s: int,
+                         workdir: str = "") -> str:
     """Wrap with a remote timeout so Claude is killed on the Mac if SSH drops.
     Portable: 'timeout' (GNU) or 'gtimeout' (macOS + coreutils), or no
     timeout if neither exists. Remote budget is 10s under the local one so
@@ -103,7 +104,8 @@ def build_remote_command(args: list[str], timeout_s: int) -> str:
         '_T=$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true); '
         f'${{_T:+$_T {remote_timeout}}}'
     )
-    return f'TASK=$(cat); {prefix} {" ".join(args)}'
+    change_dir = f"cd {shlex.quote(workdir)} || exit $?; " if workdir else ""
+    return f'TASK=$(cat); {change_dir}{prefix} {" ".join(args)}'
 
 
 def parse_result(raw: str) -> dict:
@@ -151,7 +153,13 @@ async def list_tools() -> list[types.Tool]:
                             "Optional. Session ID returned by a previous ask_claude call. "
                             "Pass this to continue the same conversation."
                         )
-                    }
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": (
+                            "Optional absolute working directory on the remote Mac."
+                        ),
+                    },
                 },
                 "required": ["task"]
             }
@@ -171,9 +179,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     task           = arguments.get("task", "").strip()
     context        = arguments.get("context", "").strip()
     resume_session = arguments.get("resume_session_id", "").strip()
+    workdir        = arguments.get("workdir", "").strip()
 
     if not task:
         return [types.TextContent(type="text", text="Error: `task` cannot be empty.")]
+    if workdir and not os.path.isabs(workdir):
+        return [types.TextContent(type="text",
+            text="Error: `workdir` must be an absolute path on the remote Mac.")]
 
     call_id    = uuid.uuid4().hex[:8]
     started_at = time.monotonic()
@@ -186,12 +198,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         "task":       task,
         "context":    context or None,
         "session_id": resume_session or None,
+        "workdir":    workdir or None,
     })
 
     prompt = f"Context:\n{context}\n\n---\n\nTask:\n{task}" if context else task
 
     claude_args = build_claude_args(MAC_CLAUDE, resume_session, SKIP_PERMISSIONS)
-    remote_cmd  = build_remote_command(claude_args, CLAUDE_TIMEOUT)
+    remote_cmd  = build_remote_command(claude_args, CLAUDE_TIMEOUT, workdir)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -221,13 +234,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         duration = round(time.monotonic() - started_at, 1)
 
         if proc.returncode != 0:
-            err = stderr.decode().strip() or f"exit code {proc.returncode}"
+            err = stderr.decode(errors="replace").strip() or f"exit code {proc.returncode}"
             log_event({"event": "error", "id": call_id,
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "duration": duration, "error": err})
             return [types.TextContent(type="text", text=f"Claude error: {err}")]
 
-        raw    = stdout.decode().strip()
+        raw    = stdout.decode(errors="replace").strip()
         parsed = parse_result(raw)
         if not parsed["structured"]:
             log_event({"event": "done", "id": call_id,

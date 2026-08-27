@@ -14,7 +14,10 @@ applies. Intentional differences, keep this list current:
 - codex has a model override (CODEX_BRIDGE_MODEL); claude does not need one
 - resume: claude uses --resume ID; codex uses exec resume ID with the
   prompt positional
+- working directory: claude changes directory in the remote shell; codex uses
+  the global --cd flag
 
 Shared and load-bearing in both: the '"$TASK"' stdin trick (see the comment
-on the arg builder), the remote timeout wrapper, log rotation, and the
-event log schema.
+on the arg builder), absolute workdir validation, shell-quoted binary and
+workdir paths, replacement-safe output decoding, the remote timeout wrapper,
+log rotation, and the event log schema.

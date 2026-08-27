@@ -2,6 +2,7 @@
 wrapper, result parsing, and log rotation. The SSH path is deliberately
 untested here; it is exercised by a supervised live delegation."""
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from server import (
     parse_result,
     should_rotate,
 )
+import server
 
 
 def test_args_default_has_no_skip_permissions():
@@ -32,6 +34,12 @@ def test_args_resume_is_quoted():
     assert args[i + 1] == "'abc; rm -rf /'"
 
 
+def test_claude_binary_is_quoted():
+    args = build_claude_args("/Applications/Claude Code/claude", "",
+                             skip_permissions=False)
+    assert args[0] == "'/Applications/Claude Code/claude'"
+
+
 def test_task_placeholder_is_literal():
     # Load-bearing: the task goes over stdin, never the command line.
     args = build_claude_args("claude", "", skip_permissions=False)
@@ -48,6 +56,24 @@ def test_remote_command_reads_stdin_and_has_timeout():
 def test_remote_timeout_floor():
     cmd = build_remote_command(["x"], 20)
     assert "30" in cmd             # never below 30s
+
+
+def test_remote_command_changes_to_quoted_workdir():
+    cmd = build_remote_command(["claude", "-p", '"$TASK"'], 600,
+                               "/Users/me/my repo")
+    assert cmd.startswith("TASK=$(cat); cd '/Users/me/my repo' || exit $?; ")
+
+
+def test_call_rejects_relative_workdir_before_ssh():
+    original_host = server.MAC_HOST
+    server.MAC_HOST = "configured-host"
+    try:
+        result = asyncio.run(server.call_tool(
+            "ask_claude", {"task": "test", "workdir": "relative/path"}
+        ))
+    finally:
+        server.MAC_HOST = original_host
+    assert "must be an absolute path" in result[0].text
 
 
 def test_parse_result_structured():
